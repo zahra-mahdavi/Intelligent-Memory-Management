@@ -1,5 +1,5 @@
 
-import argparse, random, time
+import time, random
 from collections import deque, defaultdict, Counter
 import pandas as pd
 
@@ -40,7 +40,7 @@ class PredictivePolicy(BasePolicy):
         self.context.append(page); self.last_retrain_ms=(time.time()-start)*1000.0
     def predict_next(self):
         if len(self.context)<self.n: return []
-        key=tuple(self.context); 
+        key=tuple(self.context)
         if key not in self.counts: return []
         return [p for p,_ in self.counts[key].most_common(self.prefetch_budget)]
     def prefetch(self,page):
@@ -53,18 +53,24 @@ class PredictivePolicy(BasePolicy):
 
 def generate_dynamic_trace(num_pages,length,hotset_size,stickiness,drift_pages,protected_ratio,seed=42):
     random.seed(seed)
-    protected=set(random.sample(range(num_pages),int(protected_ratio*num_pages)))
+    protected=set(random.sample(range(num_pages),max(0,int(protected_ratio*num_pages))))
     pool=[p for p in range(num_pages) if p not in protected]
     hotset=deque(random.sample(pool,min(hotset_size,len(pool))),maxlen=hotset_size)
     trace=[]
     for t in range(length):
-        if t%stickiness==0 and t>0:
+        if stickiness>0 and t%stickiness==0 and t>0:
             candidates=[p for p in pool if p not in hotset]
             replace=list(hotset)[:min(drift_pages,len(hotset))]
             for r in replace:
-                if r in hotset: hotset.remove(r)
-            if candidates: hotset.extend(random.sample(candidates,min(len(replace),len(candidates))))
-        page=random.choice(list(hotset)) if random.random()<0.85 else random.randrange(num_pages)
+                try:
+                    hotset.remove(r)
+                except ValueError:
+                    pass
+            if candidates: 
+                k=min(len(replace),len(candidates))
+                if k>0:
+                    hotset.extend(random.sample(candidates,k))
+        page=random.choice(list(hotset)) if random.random()<0.85 and len(hotset)>0 else random.randrange(num_pages)
         trace.append((page,page in protected))
     return trace,protected
 
@@ -78,7 +84,8 @@ def run_sim(policy,tiers_cfg,trace,security_check_ns=15):
             s["security_checks"]+=1; s["latency_ns_sum"]+=security_check_ns; s["energy_sum"]+=security_check_ns*0.01
         hit=False; idx_hit=None
         for idx,(tc,cfg) in enumerate(zip(policy.tiers,tiers_cfg)):
-            if page in tc: hit=True; idx_hit=idx; tc.touch(page); policy.on_hit(page,idx); break
+            if page in tc: 
+                hit=True; idx_hit=idx; tc.touch(page); policy.on_hit(page,idx); break
         if hit:
             if idx_hit==0:s["fast_hits"]+=1
             elif idx_hit==1:s["med_hits"]+=1
@@ -89,7 +96,7 @@ def run_sim(policy,tiers_cfg,trace,security_check_ns=15):
             latency=tiers_cfg[-1]["latency_ns"]*2; energy=tiers_cfg[-1]["energy"]*1.5
         s["latency_ns_sum"]+=latency; s["energy_sum"]+=energy
         if isinstance(policy,PredictivePolicy):
-            if last_pref: s["prefetch_requests"]+=1; 
+            if len(last_pref)>0: s["prefetch_requests"]+=1
             if page in last_pref: s["prefetch_correct"]+=1
             policy.observe(page); last_pref=set(policy.prefetch(page)); s["retrain_time_ms_sum"]+=policy.last_retrain_ms
     steps=max(1,s["steps"])
@@ -98,29 +105,3 @@ def run_sim(policy,tiers_cfg,trace,security_check_ns=15):
             "avg_latency_ns":s["latency_ns_sum"]/steps,"avg_energy":s["energy_sum"]/steps,
             "prefetch_accuracy":(s["prefetch_correct"]/s["prefetch_requests"]) if s["prefetch_requests"] else 0.0,
             "avg_retrain_time_ms":(s["retrain_time_ms_sum"]/steps),"security_checks":s["security_checks"]}
-
-def main():
-    p=argparse.ArgumentParser()
-    p.add_argument("--num_pages",type=int,default=2000)
-    p.add_argument("--trace_length",type=int,default=2000)
-    p.add_argument("--hotset_size",type=int,default=80)
-    p.add_argument("--stickiness",type=int,default=400)
-    p.add_argument("--drift_pages",type=int,default=20)
-    p.add_argument("--protected_ratio",type=float,default=0.05)
-    p.add_argument("--predictive",action="store_true")
-    p.add_argument("--ngram",type=int,default=2)
-    p.add_argument("--prefetch_budget",type=int,default=2)
-    p.add_argument("--out_csv",type=str,default="imm_results.csv")
-    a=p.parse_args()
-    tiers=[{"name":"Fast","capacity":256,"latency_ns":80,"energy":1.0},
-           {"name":"Medium","capacity":512,"latency_ns":250,"energy":2.0},
-           {"name":"Slow","capacity":1024,"latency_ns":1200,"energy":4.5}]
-    trace,_=generate_dynamic_trace(a.num_pages,a.trace_length,a.hotset_size,a.stickiness,a.drift_pages,a.protected_ratio)
-    results=[]
-    base=BasePolicy(tiers); r1=run_sim(base,tiers,trace); r1["policy"]="Baseline-LRU"; results.append(r1)
-    if a.predictive:
-        pred=PredictivePolicy(tiers,n=a.ngram,prefetch_budget=a.prefetch_budget)
-        r2=run_sim(pred,tiers,trace); r2["policy"]=f"Predictive-n{a.ngram}-k{a.prefetch_budget}"; results.append(r2)
-    df=pd.DataFrame(results); df.to_csv(a.out_csv,index=False); print(df.to_string(index=False)); print(f"Saved -> {a.out_csv}")
-
-if __name__=="__main__": main()
